@@ -23,7 +23,7 @@ theme: superhero
 
 Here our task is to build a predictive model for a popular dataset on [Kaggle](https://www.kaggle.com/datasets/anthonypino/melbourne-housing-market). The dataset is not particularly complex, but various features of the data make it quite challenging to model.
 
-Two datasets are provided but we shall focus on the `full` version of the data.
+Two datasets are provided but we shall focus on the larger version of the data.
 
 # Preliminaries
 
@@ -1229,10 +1229,7 @@ Finally we can plot our data:
 ```{r}
 cat_data |> 
    ggplot(aes(x = vars, y = fct_rev(rowname))) +
-   geom_point(
-      (aes(size = values, colour = above_zero)),
-      show.legend = TRUE
-   ) +
+   geom_point(aes(size = values, colour = above_zero), show.legend = TRUE) +
    scale_colour_discrete(
       type = c("#a3c1ad", "#df6919"),
       limits = c(TRUE, FALSE),  
@@ -1294,7 +1291,7 @@ cat_data |>
       plot.title.position = "plot",
       plot.margin = margin(0.75, 1.5, 0, 0.75, "cm"),
       legend.position = "bottom",
-      egend.title = element_blank(),
+      legend.title = element_blank(),
       legend.margin = margin(0, 0, 0.5, 0, "cm"),
       panel.grid.minor = element_blank()
    ) 
