@@ -1,0 +1,2379 @@
+---
+title: "Modelling the Melbourne Housing Dataset"
+subtitle: "Building a regression model using a well-known dataset from Kaggle"
+author: "Richard Ryan"
+date: "22 July 2024"
+editor: visual
+format:
+   html:
+      fig-width: 9
+      fig_height: 9 
+execute: 
+  message: false
+  warning: false
+toc: true
+toc-depth: 3
+number-sections: true
+number-depth: 3
+toc-location: "right"
+toc-title: "Section Headings"
+df-print: paged
+theme: superhero
+---
+
+Here our task is to build a predictive model for a popular dataset on [Kaggle](https://www.kaggle.com/datasets/anthonypino/melbourne-housing-market). The dataset is not particularly complex, but various features of the data make it quite challenging to model.
+
+Two datasets are provided but we shall focus on the `full` version of the data.
+
+# Preliminaries
+
+First we need to load in the packages we shall be using.
+
+For data manipulation we shall need the following:
+
+```{r}
+library(tidyverse)
+```
+
+For plotting we shall be using:
+
+```{r}
+library(patchwork)
+library(scales)
+```
+
+For building a model:
+
+```{r}
+library(tidymodels)
+library(finetune)
+library(embed)
+library(vip)
+library(bonsai)
+```
+
+For statistical tests:
+
+```{r}
+library(rstatix)
+library(DescTools)
+library(moments)
+library(bestNormalize)
+library(modeest)
+```
+
+Next we load the algorithms we shall use to build our predictive model:
+
+```{r}
+library(lightgbm)
+```
+
+The above packages have one of two conflicting function names. Therefore we resolve which of the functions we prefer as follows:
+
+```{r}
+conflicted::conflict_prefer(name = "filter", winner = "dplyr")
+conflicted::conflict_prefer(name = "discard", winner = "purrr")
+conflicted::conflict_prefer(name = "skewness", winner = "moments")
+conflicted::conflict_prefer(name = "vi", winner = "vip")
+```
+
+Finally we set a global option with regard to the formatting of numbers:
+
+```{r}
+options(scipen = 999)
+```
+
+With our preliminaries complete, we can now reading in our data:
+
+```{r}
+melbourne <- read_csv("Melbourne_housing_FULL.csv") |> 
+   janitor::clean_names()
+```
+
+Let's `glimpse()` our data to check for any wholesale errors:
+
+```{r}
+glimpse(melbourne)
+```
+
+We have read in the data correctly. Now we can see whether our data needs cleaning.
+
+# Data Cleaning
+
+Our examination of the data will focus on four areas:
+
+-   Missing values
+-   Impossible values
+-   Outliers
+-   Size variables
+
+Some of the missing and impossible values we shall be able to impute straight away. Others will be left for the data pre-processing stage of our analysis.
+
+## Missing values
+
+How big is the problem of missing values?
+
+```{r}
+map_int(melbourne, \(.x) sum(is.na(.x))) |> 
+   sort(decreasing = TRUE) |> 
+   discard(\(.x) (.x == 0))
+```
+
+First of all, any missing values for `price` will have to be dropped. This is because price is our dependent variable: we can't impute on a variable and then attempt to predict its value. This would be giving our model far too much information. So let's drop any `NA` values for `price`:
+
+```{r}
+melbourne <- drop_na(melbourne, price)
+```
+
+What about the other missing values? Although a lot of data is missing, it's not quite a hopeless case. There is enough data available to make imputation worthwhile.
+
+Indeed, some of the missing values can be know with a high degree of certainty just from looking at the data. But when we drill down into our data, we quickly find that some of the categorical variables have the value of `"#N/A"`:
+
+```{r}
+map_int(melbourne, \(x) sum(x == "#N/A")) |> 
+   sort(decreasing = TRUE) |> 
+   discard(\(.x) (.x == 0))
+```
+
+Before doing anything else, we can replace these values with `NA`:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(across(where(is.character), \(.x) if_else(.x == "#N/A", NA, .x)))
+```
+
+Now we can consider how to impute the values that are missing. It's obvious that some of the missing values can be known precisely --- namely those for `council_area`, `regionname` and `postcode`.
+
+Also consider the missing value for `distance`:
+
+```{r}
+melbourne |> 
+   filter(is.na(distance))
+```
+
+A simple Google search on the above information allows us to fill in the following gaps:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(
+      suburb = if_else(is.na(distance), "Fawkner", suburb),
+      postcode = if_else(is.na(distance), 3060, postcode),
+      distance = if_else(is.na(distance), 12.4, distance)
+   )
+```
+
+Another Google search allows us to fill in the missing values for `regionname`:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(regionname = case_when(
+      is.na(regionname) & suburb == "Fawkner" ~ "Northern Metropolitan",
+      is.na(regionname) & suburb == "Footscray" ~ "Western Metropolitan",
+      is.na(regionname) & suburb == "Camberwell" ~ "Southern Metropolitan",
+      .default = regionname
+   )) 
+```
+
+Also for `council_area`:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(council_area = case_when(
+      is.na(council_area) & suburb == "Fawkner" ~ "Hume City Council",
+      is.na(council_area) & suburb == "Footscray" ~ "Maribyrnong City Council",
+      is.na(council_area) & suburb == "Camberwell" ~ "Boroondara City Council",
+      .default = council_area 
+   ))
+```
+
+The remaining `NA`s can be imputed at our data preprocessing stage. Now on to impossible values.
+
+## Impossible values
+
+It might be thought that any impossible values would be caught when we test for outliers. However, because the data is highly skewed to the right, many of the lower values will slip through the net. For example, a house must have at least one bedroom and one bathroom, but houses that fall short of this condition won't be identified as outliers using any of the standard tests.
+
+We can start by looking at numeric values that show as zero. The following code shows variables that have at least one zero value:
+
+```{r}
+melbourne |> 
+   summarise(across(everything(), \(x) sum(x == 0, na.rm = TRUE))) |> 
+   select_if(\(x) x > 0) |> 
+   pivot_longer(
+      cols = everything(),
+      values_to = "values",
+      names_to = "vars"
+   ) |> 
+   arrange(desc(values))
+```
+
+The `car` variable can easily be zero, as not all homes come with a parking space. Similarly, we would expect zero values for `distance`, because plenty of homes will be located in the Central Business District. We can check that the `distance` values are plausible as follows:
+
+```{r}
+melbourne |> 
+   filter(distance == 0) |> 
+   count(suburb, postcode, name = "totals")
+```
+
+All of these values are in the same `suburb` and have the same `postcode`.
+
+It's much less likely that `bedroom2` and `bathroom` can have zero values. Surely all homes, or at least all houses and apartments, have to have at least a bathroom? Let's consider the features in more detail, starting with `bedroom2`.
+
+```{r}
+melbourne |> 
+   filter(bedroom2 == 0) |> 
+   select(bedroom2, rooms, type, price)
+```
+
+Here we can see a mix of houses, town-houses and apartments. It's a contradiction in terms to state that these homes don't have at least one bedroom.
+
+Furthermore, consider the `rooms` variable included above in the table above. What is this feature if not another value for bedrooms? Let's test the correlation of `rooms` and `bedroom2`:
+
+```{r}
+cor_test(melbourne, rooms, bedroom2)
+```
+
+The correlation is very high. It would appear that `bedroom2` is little more than `rooms` with a few missing values added. Therefore it will add nothing to the model and we can drop it:
+
+```{r}
+melbourne <- melbourne |> 
+   select(-bedroom2)
+```
+
+Next we can consider home with zero `bathrooms`:
+
+```{r}
+melbourne |> 
+   filter(bathroom == 0) |> 
+   count(type, name = "totals") |> 
+   arrange(desc(totals))
+```
+
+Again, it's ridiculous to describe a property as a house if it lacks a bathroom. It's possible that an apartment might not have a bathroom, but even that would be highly unusual. We are therefore justified in replacing these values with `NA`, to be imputed at a later stage.
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(bathroom = na_if(bathroom, 0))
+```
+
+The `landsize` and `building_area` variables are highly problematic and we shall consider them in a separate section.
+
+Next we can consider outliers.
+
+## Outliers
+
+Outliers are always troublesome in regression problems. The difficulty in building a good model is made much greater when outliers are present, so it can be tempting to cull these values to boost our model's performance. However, it needs to be recognised that genuine data is often packed with statistical outliers. To remove or overwrite these values is tantamount to falsifying the data.
+
+Therefore in what follows our approach will be conservative. We shall avoid classifying a data point as an outlier unless its value doesn't seem possible.
+
+Let's start with `price`, our dependent variable. To provide some context, we can add a column showing the median price of all homes. Outliers are calculated using the `identify_outliers()` function from the `{rstatix}` package:
+
+```{r}
+melbourne |> 
+   mutate(median_price = median(price)) |> 
+   identify_outliers(price) |> 
+   select(price, median_price, rooms, is.outlier, is.extreme) |> 
+   arrange(desc(price))
+```
+
+Here we can use our domain knowledge to address the problem. Given a median figure of \$870k, the higher prices aren't at all implausible. Similarly, the very low values are all very believable, too. So nothing needs doing here.
+
+Next let's look at `distance`, once again including a column showing the median value:
+
+```{r}
+melbourne |> 
+   mutate(median_distance = median(distance, na.rm = TRUE)) |> 
+   identify_outliers(distance) |> 
+   select(distance, median_distance, suburb, is.outlier, is.extreme) |> 
+   arrange(desc(distance))
+```
+
+Again, this seems reasonable given we are talking about a very large city. The suburb feature indicates that the data is self-consistent, so again we have nothing to do.
+
+Next we have the `rooms` variable:
+
+```{r}
+melbourne |> 
+   mutate(median_rooms = median(rooms, na.rm = TRUE)) |> 
+   identify_outliers(rooms) |> 
+   select(rooms, median_rooms, suburb, is.outlier, is.extreme) |> 
+   arrange(desc(rooms))
+```
+
+A house with 16 bedrooms is unusual, but in a city the size of Melbourne such houses will undoubtedly exist. Therefore the data seems reasonable and no changes are needed.
+
+Next we can consider `bathrooms`. Here what we are looking for is not the number of bathrooms *per se* but rather the relationship between the `bathroom` and `room` features. Once again, we include median figures for context, this time grouped by `suburb`.
+
+```{r}
+melbourne |> 
+   group_by(suburb) |> 
+   mutate(
+      median_rooms = median(rooms, na.rm = TRUE),
+      median_bathroom = median(bathroom, na.rm = TRUE)
+   ) |> 
+   ungroup() |> 
+   identify_outliers(bathroom) |> 
+   select(bathroom, rooms, median_bathroom, median_rooms, is.outlier, is.extreme) |> 
+   arrange(desc(bathroom)) 
+```
+
+Some of these values are difficult. For example, a house having twice as many bathrooms and bedrooms does not seem very plausible, particularly when viewed against the corresponding median value.
+
+It's not easy to find an objective way of treating these outliers. Our approach will be to cap the number of bathrooms at the number of bedrooms the property has. This approach respects the fact that housing stock is diverse while eliminating obvious errors in our data.
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(bathroom = if_else(bathroom > rooms, rooms, bathroom))
+```
+
+Next we have `car`:
+
+```{r}
+melbourne |> 
+   identify_outliers(car) |> 
+   select(car, price, rooms, bathroom, is.outlier, is.extreme) |>
+   arrange(desc(car))
+```
+
+Some of these are absurd. A two bedroom place with parking for 18 cars seems crazy. Even if it's true, it surely won't be something that adds much value to the property.
+
+It seems reasonable to set the cut-off as five and impute the rest:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(car = if_else(car > 5, 5, car))
+```
+
+Finally we can look at `year_built`:
+
+```{r}
+melbourne |> 
+   summarise(
+      min_date = min(year_built, na.rm = TRUE),
+      med_date = median(year_built, na.rm = TRUE),
+      max_date = max(year_built, na.rm = TRUE)
+   )
+```
+
+The `min_date` is obviously an error. Let's `filter()` our data to see how many values might be a problem:
+
+```{r}
+melbourne |> 
+   filter(year_built < 1800)
+```
+
+This single value can be easily replaced. Let's set the dame to the `mode()` of the `year_built` for the `suburb` in question:
+
+```{r}
+melbourne <- melbourne |> 
+   group_by(suburb) |> 
+   mutate(year_built = if_else(year_built < 1800, mfv(year_built), year_built)) |> 
+   ungroup()
+```
+
+The `max_date` is also problematic. As we can see, sometimes the `year_built` exceeds the last sale price as given in the `date` feature:
+
+```{r}
+melbourne |> 
+   filter(year_built > 2018)
+```
+
+This isn't impossible, because the house might have been sold before construction had finished. However, on the balance of probabilities, we're justified in assuming that this is an error.
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(year_built = if_else(year_built > 2018, 2018, year_built))
+```
+
+We can now consider the `landsize` and `building_area` variables.
+
+## The size variables
+
+These features are particularly difficult. If we start with the `landsize` variable, we quickly see that the data is of particularly poor quality. For example, we can consider the zero values:
+
+```{r}
+melbourne |> 
+   filter(landsize == 0) |> 
+   count(type)
+```
+
+It goes without saying that any house or townhouse must has some degree of `landsize`. We could follow our previous strategy of replacing these values with `NA` and imputing them either now or later. However, the problems with this particular feature are so bad, it hardly seems worth the effort.
+
+Consider the following test for outliers:
+
+```{r}
+melbourne |> 
+   group_by(type) |> 
+   mutate(med_land = median(landsize, na.rm = TRUE)) |> 
+   ungroup() |> 
+   mutate(difference = landsize - med_land) |> 
+   identify_outliers(difference)|> 
+   select(type, landsize, med_land, difference, is.outlier, is.extreme) |> 
+   arrange(desc(difference)) 
+```
+
+Even a brief scroll through the data shows that this is a mess. The median `landsize` for apartments is zero, as we would expect. Yet there are numerous apartments listed as having over ten thousand square meters.
+
+A sign of how bad our `landsize` data is can be seen when we compare it to `price`. We would expect `landsize` to be correlated with `price`, at least for houses, but this is not the case:
+
+```{r}
+melbourne |> 
+   filter(type == "h") |> 
+   cor_test(landsize, price)
+```
+
+There is almost no correlation at all. The bast solution seems to drop the feature entirely:
+
+```{r}
+melbourne <- melbourne |> 
+   select(-landsize)
+```
+
+Thankfully, the quality of the `building_area` feature is much higher --- which is not to say that work doesn't need doing. For example, there are many zero values:
+
+```{r}
+melbourne |> 
+   filter(building_area == 0) |> 
+   select(building_area, type, rooms, bathroom, suburb)
+```
+
+One of the problems we have is knowing what `building_area` signifies. It could mean the internal space of a property, or it could mean the size of the land that the property occupies. In either scenario, we shouldn't be seeing zero values. We can follow our standard practice and replace these values with `NA`, imputing a more sensible value later:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(building_area = na_if(building_area, 0))
+```
+
+However, we can't stop there. There are many values that are above zero but which are equally impossible --- for example, there are numerous instances where the building area is one square meter.
+
+As before, standard tests for outliers will struggle to identify these values, owing to the distibution of `building_area` being highly skewed to the right. We can work around this problem by calculating a median value grouped by property type and number of rooms.
+
+What we shall do is calculate the median value by `type` and number of `rooms`. We can then calculate the difference between the `building_area` and the `median()` figure. Once we have the median figure, we can calculate the difference from the observed value as a ratio.
+
+```{r}
+melbourne <- melbourne |> 
+   group_by(type, rooms) |> 
+   mutate(med_building_area = median(building_area, na.rm = TRUE)) |> 
+   ungroup() |> 
+   mutate(difference = building_area - med_building_area) |>
+   mutate(ratio = abs(difference) / med_building_area)
+```
+
+Now let's look at our data:
+
+```{r}
+melbourne |> 
+   select(rooms, building_area, med_building_area, difference, ratio) |> 
+   filter(difference < 0, ratio > 0.5) |> 
+   arrange(desc(ratio)) 
+```
+
+The closer the `ratio` gets to 1 the smaller the property compared to the median. It seems reasonable, having reviewed the data, to convert any values to `NA` that are less than half of the size of the median property (as calculated above). Thus:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(building_area = if_else(
+      condition = difference < 0 & ratio > 0.5,
+      true = NA_real_,
+      false = building_area
+   ))
+```
+
+We can now consider any outliers at the higher end. Domain knowledge beats statistical test in this instance, so let's manually inspect our data and consider the best point to re-assign values to `NA`. The `ratio` feature we have engineered is helpful here:
+
+```{r}
+melbourne |> 
+   select(building_area, med_building_area, difference, ratio) |> 
+   arrange(desc(ratio)) |> 
+   head(2000)
+```
+
+This kind of process is always somewhat arbitrary, but any ratios higher than 3 are highly suspect. Let's use that as the cut-off:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(building_area = if_else(
+      condition = ratio > 3,
+      true = NA,
+      false = building_area
+   )) |> 
+   select(-med_building_area, -difference, -ratio)
+```
+
+We can see that the `building_area` variable, for all its problems, is still reasonably correlated with `price`:
+
+```{r}
+cor_test(melbourne, building_area, price)
+```
+
+We can now begin to explore our data visually.
+
+# Data Exploration
+
+There are several different types of variables we have to visualise.
+
+-   Continuous numeric variables
+-   Discrete numeric variables
+-   Categorical variables
+-   Date variables
+-   Location variables
+
+We shall plot these various types in their own section, starting with numeric values.
+
+## Numeric variables
+
+As we said above, numeric variables fall into two distinct types, continuous and discrete; but in our first plot we can consider these two types together.
+
+Let's consider how these variables are correlated with each other and also with the target variable. To do this we shall use a correlation plot. Although there are several packages that make this a relatively easy process, we shall use only basic `{ggplot}` functions to build our visualisation.
+
+We start by building the relevant data structure. Usually this is a `matrix` but `cor_mat()` from the `{rstatix}` package helpfully returns a dataframe. We use the `pull_lower_triangle()` function to remove the top half of the correlated dataframe and then put our data into the long format:
+
+```{r}
+num_data <- melbourne |> 
+   select(price, building_area, rooms, bathroom, car, distance, propertycount) |> 
+   cor_mat() |> 
+   pull_lower_triangle() |> 
+   pivot_longer(
+      cols = price:propertycount,
+      names_to = "vars",
+      values_to = "values"
+   ) 
+```
+
+We now need to tidy our data. We also add an `above_zero` feature, as we shall need to be able to show on our plot when the correlation is positive or negative:
+
+```{r}
+num_data <- num_data |> 
+   mutate(
+      values = as.numeric(na_if(values, "")),
+      above_zero = if_else(values > 0, TRUE, FALSE),
+      values = abs(values)
+   )
+```
+
+We shall need a vector of feature names, as follows:
+
+```{r}
+num_levels <- 
+   pull(num_data, rowname) |> 
+   unique()
+```
+
+We use the `num_levels` vector to turn `rowname` and `vars` into ordered factors. If this is not done, the variables will not line up in the order needed on the plot axes.
+
+```{r}
+num_data <- num_data |> 
+   drop_na() |> 
+   mutate(across(
+      rowname:vars, \(x) factor(x, levels = num_levels, ordered = TRUE)
+   ))
+```
+
+We can now build the actual plot:
+
+```{r}
+num_data |> 
+   ggplot(aes(x = vars, y = fct_rev(rowname))) +
+   geom_point(aes(size = values, colour = above_zero)) +
+   scale_colour_discrete(
+      type = c("#a3c1ad", "#df6919"),
+      limits = c(TRUE, FALSE),  
+      labels = c(
+         "TRUE" = "Positive Correlation",
+         "FALSE" = "Negative Correlation"
+      )
+   ) +
+   guides(
+      size = "none", 
+      colour = guide_legend(override.aes = list(size = 4))
+   ) + 
+   labs(
+      x = element_blank(), y = element_blank(),
+      title = "Showing the Correlation of Numeric Variables",
+      subtitle = "With the size of point displaying the degree of correlation"
+   ) +
+   theme_minimal() + 
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 10, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 16, 
+         colour = "white", 
+         margin = margin(0, 0, 7.5, 0)
+      ),
+      plot.subtitle = element_text(
+         face = "italic", 
+         size = 12, 
+         colour = "white", 
+         margin = margin(0, 0, 10, 0)
+      ),
+      legend.text = element_text(
+         face = "bold", 
+         size = 11, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white",
+         linewidth = 0.1
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d", 
+         colour = "#3b4d5b", 
+         linewidth = 4.5
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.75, 1.5, 0, 0.75, "cm"),
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      legend.margin = margin(0, 0, 0.5, 0, "cm"),
+      panel.grid.minor = element_blank()
+      
+   ) 
+```
+
+Interestingly, `propertycount` is negatively correlated with everything. The `distance` feature is also intriguing --- although it is negatively correlated with `price`, it is positively correlated with everything else. So properties toward the centre on Melbourne have fewer bedrooms and bathrooms but are still more expensive.
+
+This is not to say that `rooms` and `bathroom` aren't important. As we can see, they are both very strongly correlated with `price`. Before we consider the importance of `rooms` and `bathroom` in greater depth, let's look at the continuous numeric variables.
+
+### Continuous numeric variables
+
+One of the most important questions we can ask about numeric variables is their distribution. The variables in question are:
+
+-   Price
+-   Building area
+-   Land size
+-   Property count
+
+Let's see how their values are distributed.
+
+```{r}
+p1 <- melbourne |> 
+   ggplot(aes(x = price)) +
+   geom_histogram(
+      colour = "black", 
+      fill = "#a3c1ad",
+      bins = 30
+   ) +
+   scale_x_continuous(
+      limits = c(0, 11e+06),
+      breaks = seq(0, 9e+06, by = 3e+06),
+      labels = c("$0m", "$3m", "$6m", "$9m")
+   ) +
+   scale_y_continuous(label = label_comma()) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "The Distribution of the Price Variable"
+   ) +
+   theme_light() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 9.5, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 0.75
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.5, 0.75, 0.25, 0.5, "cm"),
+      panel.grid.minor = element_blank()
+   )
+
+p2 <- melbourne |> 
+   ggplot(aes(x = building_area)) +
+   geom_histogram(
+      colour = "black", 
+      fill = "#a3c1ad",
+      bins = 30
+   ) +
+   scale_x_continuous(label = label_currency(prefix = "", suffix = "sqm")) +
+   scale_y_continuous(
+      limits = c(0, 3250),
+      breaks = seq(0, 3000, by = 1000), 
+      label = label_comma()
+   ) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "The Distribution of the Building Area Variable"
+   ) +
+   theme_light() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 9.5, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 0.75
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.5, 0.75, 0.25, 0.5, "cm"),
+      panel.grid.minor = element_blank()
+   )
+
+p3 <- melbourne |> 
+   ggplot(aes(x = distance)) +
+   geom_histogram(
+      colour = "black", 
+      fill = "#a3c1ad",
+      bins = 30
+   ) +
+   scale_x_continuous( 
+      breaks = seq(0, 40, by = 10),
+      label = label_currency(prefix = "", suffix = "km")
+   ) +
+   scale_y_continuous(label = label_comma()) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "The Distribution of the Distance Variable"
+   ) +
+   theme_light() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 9.5, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 0.75
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.5, 0.75, 0.25, 0.5, "cm"), 
+      panel.grid.minor = element_blank()
+   )
+
+p4 <- melbourne |> 
+   ggplot(aes(x = propertycount)) +
+   geom_histogram(
+      colour = "black", 
+      fill = "#a3c1ad",
+      bins = 30 
+   ) +
+   scale_x_continuous(label = label_comma()) + 
+   scale_y_continuous(
+      limits = c(0, 3250),
+      label = label_comma()
+   ) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "The Distribution of the Property Count Variable"
+   ) +
+   theme_light() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 9.5, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 0.75
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.5, 0.75, 0.25, 0.5, "cm"),
+      panel.grid.minor = element_blank()
+   )
+```
+
+```{r}
+(p1 + p3) / (p2 + p4) +
+   plot_annotation(theme = theme(
+      plot.background = element_rect(
+         fill = "#3b4d5b",
+         colour = "#3b4d5b"
+      )))
+```
+
+First we pull the vectors we shall need, dropping an `NA` values:
+
+```{r}
+price <- melbourne |> 
+   pull(price)
+
+building_area <-  melbourne |> 
+   drop_na(building_area) |> 
+   pull(building_area)
+
+distance <- melbourne |> 
+   drop_na(distance) |> 
+   pull(distance)
+
+property_count <- melbourne |> 
+   drop_na(propertycount) |> 
+   pull(propertycount)
+```
+
+Next let's see how skewed each of their distributions is. Here we use the `boxcox()` and the `bestNormalize()` functions from the `{bestNormalize}` package.
+
+```{r}
+tibble(
+   variables = c(
+      "price", 
+      "building area", 
+      "distance", 
+      "property count"
+   ),
+   skewness = c(
+      skewness(price),
+      skewness(building_area),
+      skewness((distance)),
+      skewness(property_count)
+   ),
+   log = c(
+      skewness(log(price)),
+      skewness(log(building_area)),
+      skewness(log1p(distance)),
+      skewness(log(property_count))
+   ),
+   bestnorm = c(
+      skewness(predict(bestNormalize(price))),
+      skewness(predict(bestNormalize(building_area))),
+      skewness(predict(bestNormalize(distance))),
+      skewness(predict(bestNormalize(property_count)))
+   )
+)
+```
+
+Clearly we can see that these variables can be transformed into something almost perfectly normal. However, a better option might be to use an algorithm that does not rely upon our data being normally distributed. This is especially true given that such an algorithm would perform well with highly correlated data too.
+
+### Discrete variables
+
+Discrete numeric variables are often difficult to model. The variables in question are as follows:
+
+-   rooms
+-   bathroom
+-   car
+
+We can start with `rooms`:
+
+```{r}
+melbourne |> 
+   mutate(
+      rooms = if_else(rooms > 6, 7, rooms),
+      rooms = factor(rooms)
+   ) |> 
+   ggplot(aes(x = rooms, y = price)) +
+   geom_boxplot(
+      colour = "ivory3", 
+      fill = "#3b4d5b",
+      linewidth = 1,
+      outlier.shape = NA,
+      alpha = 0.7
+   ) +
+   scale_x_discrete(labels = c(as.character(1:7))) +
+   scale_y_continuous(
+      limits = c(0, 4.5e06), 
+      label = label_dollar()
+   ) +
+   labs(
+      x = "Number of Bedrooms",
+      y = element_blank(),
+      title = "Showing Bedrooms Against Price",
+      subtitle = "With outliers removed for improved readability"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 10, 
+         colour = "white"
+      ),
+      axis.title.x = element_text(
+         face = "bold", 
+         size = 12, 
+         colour = "white", 
+         vjust = -2
+      ), 
+      plot.title = element_text(
+         face = "bold", 
+         size = 16, 
+         colour = "white", 
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         face = "italic",
+         size = 11,
+         colour = "white",
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d", 
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.margin = margin(1, 1.5, 1, 1, "cm")
+   )
+```
+
+We can see that `price` increases with the number of `rooms`, in more or less a linear manner, at least until we reach six bedrooms. This appears to be a strong predictor and is likely to make a significant contribution to our model.
+
+Next we have `bathroom`:
+
+```{r}
+melbourne |> 
+   mutate(
+      bathroom = if_else(bathroom > 6, 7, bathroom),
+      bathroom = factor(bathroom)
+   ) |> 
+   drop_na(bathroom) |> 
+   ggplot(aes(x = bathroom, y = price)) +
+   geom_boxplot(
+      colour = "ivory3", 
+      fill = "#3b4d5b",
+      outlier.shape = NA,
+      linewidth = 1,
+      alpha = 0.7
+   ) +
+   scale_x_discrete(labels = c(as.character(0:6))) +
+   scale_y_continuous(
+      limits = c(0, 7e06),
+      label = label_currency()
+   ) +
+   labs(
+      x = "Number of Bathrooms",
+      y = element_blank(),
+      title = "The Relationship Between Number of Bathrooms and Price",
+      subtitle = "With outliers removed for improved readability"
+   ) + 
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      axis.title.x = element_text(
+         face = "bold",
+         size = 11,
+         colour = "white",
+         vjust = -2
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 14, 
+         colour = "white",
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         face = "italic", 
+         size = 10, 
+         colour = "white",
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d", 
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.margin = margin(1, 1.5, 1, 1, "cm") 
+   )
+```
+
+We see again a strong, broadly linear, relationship between `price` and `bathrooms`. This variable should, like the `rooms` feature, figure prominently in our model.
+
+Our final discrete variable is `car`:
+
+```{r}
+melbourne |> 
+   mutate(car = factor(car)) |> 
+   drop_na(car) |> 
+   ggplot(aes(x = car, y = price)) +
+   geom_boxplot(
+      colour = "ivory3", 
+      fill = "#3b4d5b",
+      outlier.shape = NA, 
+      linewidth = 1,
+      alpha = 0.7
+   ) +
+   scale_x_discrete(labels = c(as.character(0:5))) +
+   scale_y_continuous(
+      limits = c(0, 3.25e06),
+      label = label_currency()
+   ) +
+   labs(
+      x = "Number of Car Spaces",
+      y = element_blank(),
+      title = "The Relationship Between Car Spaces and Price",
+      subtitle = "With outliers removed for improved readabilty"
+   ) + 
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 9, 
+         colour = "white"
+      ),
+      axis.title.x = element_text(
+        face = "bold",
+        size = 11,
+        colour = "white",
+        vjust = -2
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 14, 
+         colour = "white",
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         face = "italic",
+         size = 10,
+         colour = "white",
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.1
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.margin = margin(1, 1.5, 1, 1, "cm") 
+   )
+```
+
+Here there appears to be much less in the way of a linear relationship between `price` and `car`. It seems implausible that the two features are not more closely related. I suspect the relationship is obscured by more expensive properties being toward the centre of Melbourne where space is often at a premium.
+
+## Categorical variables
+
+We next consider the categorical variables in our dataset:
+
+-   suburb
+-   type
+-   method
+-   seller_g
+-   postcode
+-   council_area
+-   regionname
+
+Building a correlation plot for categorical features is rather more complicated for non-numeric features, but a couple of functions from the `{DescTools}` package will make life much easier. See [this page](https://www.statology.org/interpret-cramers-v/) for the underlying methodology of `Cramer's V`.
+
+The process is much the same as before, except we use the `PairApply()` function to derive the correlations:
+
+```{r}
+cat_data <- melbourne |> 
+   select(suburb, type, method, seller_g, postcode, council_area, regionname) |> 
+   mutate(postcode = as.character(postcode)) |> 
+   PairApply(cramer_v, symmetric = TRUE) |> 
+   pull_lower_triangle() |> 
+   pivot_longer(
+      cols = suburb:regionname,
+      names_to = "vars",
+      values_to = "values"
+   ) |> 
+   mutate(values = na_if(values, "")) |> 
+   drop_na() 
+```
+
+```{r}
+cat_vars <- melbourne |>
+   select(suburb, type, method, seller_g, postcode, council_area, regionname) |> 
+   colnames()
+```
+
+```{r}
+cat_data <- cat_data |> 
+   mutate(
+      values = as.numeric(na_if(values, "")),
+      above_zero = if_else(values > 0, TRUE, FALSE),
+      values = abs(values)
+   )
+```
+
+We convert the `rowname` and `vars` features to factors and order them using the `cat_vars` vector:
+
+```{r}
+cat_data <- cat_data |> 
+   mutate(across(
+      rowname:vars, \(x) factor(x, levels = cat_vars, ordered = TRUE)
+   )) |> 
+   drop_na()
+```
+
+Finally we can plot our data:
+
+```{r}
+cat_data |> 
+   ggplot(aes(x = vars, y = fct_rev(rowname))) +
+   geom_point(
+      (aes(size = values, colour = above_zero)),
+      show.legend = TRUE
+   ) +
+   scale_colour_discrete(
+      type = c("#a3c1ad", "#df6919"),
+      limits = c(TRUE, FALSE),  
+      labels = c(
+         "TRUE" = "Positive Correlation",
+         "FALSE" = "Negative Correlation"
+      )
+   ) +
+   guides(
+      size = "none", 
+      colour = guide_legend(override.aes = list(size = 5))
+   ) + 
+   labs(
+      x = element_blank(), y = element_blank(),
+      title = "Showing the Correlation of Numeric Variables",
+      subtitle = "With the size of point displaying the degree of correlation"
+   ) +
+   theme_minimal() + 
+   theme(
+      axis.text = element_text(
+         face = "bold", 
+         size = 10, 
+         colour = "white"
+      ),
+      plot.title = element_text(
+         face = "bold", 
+         size = 16, 
+         colour = "white", 
+         margin = margin(0, 0, 7.5, 0)
+      ),
+      plot.subtitle = element_text(
+         face = "italic", 
+         size = 12, 
+         colour = "white", 
+         margin = margin(0, 0, 10, 0)
+      ),
+      legend.text = element_text(
+         face = "bold", 
+         size = 11, 
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b", 
+         linewidth = 0.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d", 
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d", 
+         colour = "#3b4d5b", 
+         linewidth = 4.5
+      ),
+      axis.ticks = element_line(
+         linewidth = 1, 
+         colour = "white"
+      ),
+      plot.title.position = "plot",
+      plot.margin = margin(0.75, 1.5, 0, 0.75, "cm"),
+      legend.position = "bottom",
+      egend.title = element_blank(),
+      legend.margin = margin(0, 0, 0.5, 0, "cm"),
+      panel.grid.minor = element_blank()
+   ) 
+```
+
+Interestingly, there are no negatively correlated pairs of variables. This heavy inter correlation can make modelling difficult, so we shall focus on those algorithms best suited to the task.
+
+Now let's see how these features are correlated with `price`, starting with `type`:
+
+```{r}
+melbourne |> 
+   ggplot(aes(x = type, y = price)) +
+   geom_boxplot(
+      colour = "ivory", 
+      fill = "#3b4d5b",
+      linewidth = 1, 
+      outlier.shape = NA
+   ) +
+   scale_x_discrete(label = c("house", "townhouse", "apartment")) +
+   scale_y_continuous(
+      limits = c(0, 2.5e+06),
+      breaks = seq(0, 2e+06, by = 1e+06),
+      label = label_currency()
+   ) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "Showing the Price Distributions of Home Types",
+      subtitle = "With outliers removed for improved readability"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold", 
+         size = 10
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold", 
+         size = 16,
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         colour = "white",
+         face = "italic", 
+         size = 12,
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white",
+         linewidth = 0.1
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(1, 1.5, 1, 1, "cm")
+   )
+```
+
+Next we consider the `method` variable:
+
+```{r}
+melbourne |> 
+   mutate(method = fct_reorder(method, price)) |> 
+   ggplot(aes(x = fct_rev(method), y = price)) +
+   geom_boxplot(
+      colour = "ivory",
+      fill = "#3b4d5b",
+      linewidth = 1,
+      outlier.shape = NA
+   ) +
+   scale_y_continuous(
+      limits = c(0, 3.25e+06),
+      label = label_currency()
+   ) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Showing the Price Distributions of Sale Types",
+      subtitle = "With outliers removed for improved readability"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 16, 
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         colour = "white",
+         face = "italic",
+         size = 12,
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(1, 1.5, 1, 1, "cm")
+   )
+```
+
+There do appear to be significant differences in median price for this feature, though it does not appear to have the predictive power of `type`. Which is, of course, as we would expect.
+
+Next we can consider the `regionname`:
+
+```{r}
+melbourne |>
+   drop_na(regionname) |> 
+   mutate(regionname = str_replace(regionname, "Metropolitan", "Met")) |> 
+   mutate(regionname = fct_reorder(regionname, price)) |> 
+   ggplot(aes(x = fct_rev(regionname), y = price)) +
+   geom_boxplot(
+      colour = "ivory3", 
+      fill = "#3b4d5b",
+      linewidth = 1, 
+      outlier.shape = NA
+   ) +
+   scale_y_continuous(
+      limits = c(0, 3.25e+06),
+      label = label_currency()
+   ) +
+   labs(
+      x = element_blank(), 
+      y = element_blank(),
+      title = "Showing the Price Distribution by Region Name",
+      subtitle = "With outliers removed for improved readability"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text.y = element_text(
+         colour = "white",
+         face = "bold", 
+         size = 10
+      ),
+      axis.text.x = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10, 
+         angle = 45, 
+         hjust = 1
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold", 
+         size = 16,
+         vjust = 2.25
+      ),
+      plot.subtitle = element_text(
+         colour = "white",
+         face = "italic", 
+         size = 12,
+         vjust = 2
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.grid.major = element_line(
+        colour = "#3b4d5b",
+        linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      plot.title.position = "plot",
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(1, 1.5, 0.25, 1, "cm")
+   )
+```
+
+Again, we something like a linear relationship to `price`.
+
+Our remaining categorical variables are difficult to plot because they are very high-dimensional. Indeed it makes sense to consider them alongside the location variables, which we shall now do.
+
+## Location variables
+
+One of the things we saw in our correlation plot was that `price` and `distance` were negatively correlated. Therefore if we plot `latitude` and `longitude` we should see the more expensive houses toward the centre of our plot.
+
+In what follows, we shall include, alongside `latitude` and `longitude`, the following categorical variables:
+
+-   council area
+-   suburb
+-   postcode
+
+Our strategy we be to group our dataset by each of the above variables and create a median price. We can then use the `latitude` and `longitude` features to cast this median price into a map like form.
+
+Let's create our first plot:
+
+```{r}
+p1 <- melbourne |> 
+   ggplot(aes(x = lattitude, y = longtitude, z = price)) +
+   stat_summary_hex(bins = 40) +
+   scale_fill_steps2(
+      low = "#27333c", 
+      mid = "#455a6a",
+      high = "ivory", 
+      limits = c(0, 2.5e+06),
+      breaks = c(5e+05, 1e+06, 1.5e+06, 2e+06)
+   ) +
+   scale_y_continuous(
+      breaks = c(144.5, 144.9, 145.3) 
+   ) +  
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Latitude and Longitude"
+   ) + 
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 8
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10,
+         vjust = 3
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#1d262d"
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      legend.position = "none"
+   )
+```
+
+Our second plot:
+
+```{r}
+p2 <- melbourne |> 
+   group_by(council_area) |> 
+   mutate(med_price = median(price)) |> 
+   ungroup() |> 
+   ggplot(aes(x = lattitude, y = longtitude, z = med_price)) + 
+   stat_summary_hex(bins = 40) +
+   scale_fill_steps2(
+      low = "#27333c", 
+      mid = "#455a6a",
+      high = "ivory", 
+      limits = c(0, 2.5e+06),
+      breaks = c(5e+05, 1e+06, 1.5e+06, 2e+06),
+      labels = c("$500k", "$1.0m", "$1.5m", "$2.0m")
+   ) +
+   scale_y_continuous(
+      breaks = c(144.5, 144.9, 145.3) 
+   ) +   
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Council Area"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 8
+      ), 
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10,
+         vjust = 3
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#1d262d"
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      legend.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      legend.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot"
+   )
+```
+
+Our third plot:
+
+```{r}
+p3 <- melbourne |> 
+   group_by(suburb) |> 
+   mutate(med_price = median(price)) |> 
+   ungroup() |> 
+   ggplot(aes(x = lattitude, y = longtitude, z = med_price)) + 
+   stat_summary_hex(bins = 40) +
+   scale_fill_steps2(
+      low = "#27333c", 
+      mid = "#455a6a",
+      high = "ivory", 
+      limits = c(0, 2.5e+06),
+      breaks = c(5e+05, 1e+06, 1.5e+06, 2e+06),
+      labels = c("$500k", "$1.0m", "$1.5m", "$2.0m")
+   ) +
+   scale_y_continuous(
+      breaks = c(144.5, 144.9, 145.3)
+   ) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Suburb"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 8
+      ), 
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10,
+         vjust = 3
+      ),
+      legend.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      legend.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#1d262d"
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      legend.position = "none"
+   )
+```
+
+And our fourth:
+
+```{r}
+p4 <- melbourne |> 
+   group_by(postcode) |> 
+   mutate(med_price = median(price)) |> 
+   ungroup() |> 
+   ggplot(aes(x = lattitude, y = longtitude, z = med_price)) + 
+   stat_summary_hex(bins = 40) +
+   scale_fill_steps2(
+      low = "#27333c", 
+      mid = "#455a6a",
+      high = "ivory", 
+      limits = c(0, 2.5e+06),
+      breaks = c(5e+05, 1e+06, 1.5e+06, 2e+06),
+      labels = c("$500k", "$1.0m", "$1.5m", "$2.0m")
+   ) +
+   scale_y_continuous(
+      breaks = c(144.5, 144.9, 145.3)
+   ) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Postcode"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 8
+      ), 
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10,
+         vjust = 3
+      ),
+      legend.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      legend.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#1d262d"
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot"
+   )
+```
+
+We can now use `{patchwork}` to knit these plots together.
+
+```{r}
+p1 + p2 +
+   plot_annotation(
+      title = "Showing how location affects the median house price (I)",
+      subtitle = paste(
+         "Our data shows that homes are more expensive",
+         "in the centre of Melbourne"
+      ),
+      theme = theme(
+         plot.title = element_text(
+            colour = "white",
+            face = "bold",
+            size = 14,
+            margin = margin(1, 0.25, 0.25, 0, "cm"),
+            vjust = 7
+         ),
+         plot.subtitle = element_text(
+            colour = "white",
+            face = "italic",
+            size = 11,
+            vjust = 4
+         ),
+         plot.background = element_rect(
+            fill = "#1d262d",
+            colour = "#3b4d5b",
+            linewidth = 4.5
+         ),
+         plot.margin = margin(0.5, 0.5, 0.55, 0.5, "cm")
+      )
+   )
+```
+
+Next we can plot `suburb` and `postcode`:
+
+```{r}
+p3 + p4 +
+   plot_annotation(
+      title = "Showing how location affects the median house price (II)",
+      subtitle = paste(
+         "Our data shows that homes are more expensive",
+         "in the centre of Melbourne"
+      ),
+      theme = theme(
+         plot.title = element_text(
+            colour = "white",
+            face = "bold",
+            size = 14,
+            margin = margin(1, 0.25, 0.25, 0, "cm"),
+            vjust = 7
+         ),
+         plot.subtitle = element_text(
+            colour = "white",
+            face = "italic",
+            size = 11,
+            vjust = 4
+         ),
+         plot.background = element_rect(
+            fill = "#1d262d",
+            colour = "#3b4d5b",
+            linewidth = 4.5
+         ),
+         plot.margin = margin(0.5, 0.5, 0.55, 0.5, "cm")
+      )
+   )
+```
+
+Clearly, all four of these plots tell a very similar story. Therefore we must choose an algorithm that can handle such a degree of correlation when building our model.
+
+## Date variables
+
+First we must convert the `date` feature into the correct format:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(date = dmy(date))
+```
+
+We can now plot the change in `price` over time:
+
+```{r}
+melbourne |> 
+   group_by(date) |> 
+   summarise(med_price = median(price)) |> 
+   ungroup() |> 
+   ggplot(aes(x = date, y = med_price)) +
+   geom_line(
+      colour = "ivory3", 
+      linewidth = 1,
+      alpha = 0.5
+   ) +
+   geom_smooth(
+      formula = y ~ x,
+      method = "loess",
+      group = 1, 
+      colour = "#8e8e00",
+      linewidth = 1.25
+   ) +
+   scale_x_date(
+      date_breaks = "6 month",
+      date_labels = "%b %Y"
+   ) +
+   scale_y_continuous(
+      limits = c(5e+05, 1.1e+06),
+      breaks = seq(6e+05, 1e+06, by = 1e+05),
+      label = label_currency()
+   ) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "House prices in Melbourne over time",
+      subtitle = "Showing a possible decline in property prices"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 16,
+         vjust = 2
+      ),
+      plot.subtitle = element_text(
+         colour = "white",
+         face = "italic",
+         size = 12,
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5 
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.margin = margin(1, 1.5, 0.75, 1, "cm")
+   )
+```
+
+It isn't by any mean conclusive that property prices are actually in decline; but it's certainly worth including the `date` feature in our model.
+
+Finally, let's consider `year_built`.
+
+```{r}
+melbourne |> 
+   ggplot(aes(x = year_built, y = log10(price))) +
+   geom_point(colour = "#3b4d5b", alpha = 0.5) +
+   geom_smooth(colour = "#8e8e00", linewidth = 1.25) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Showing house price by year built",
+      subtitle = "Price shown on a log10 scale for improved readability"
+   ) +
+   theme_minimal() + 
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 16,
+         vjust = 2.5
+      ),
+      plot.subtitle = element_text(
+         colour = "white",
+         face = "italic",
+         size = 12,
+         margin = margin(0, 0.25, 0.25, 0, "cm"),
+         vjust = 2
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white"
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.margin = margin(1, 1.5, 0.75, 1, "cm")
+   )
+```
+
+Here it seems that older properties are more expensive. No doubt these properties will be concentrated in the centre of Melbourne, so once again we shall have a high degree of correlation with which to contend.
+
+Our data exploration is now complete and we cna begin to build our model
+
+# Building a Model
+
+We shall start with some feature engineering on the entire dataset. We shall then split our dataset into training and test sets, together with a cross validation set for training our hyper-parameters.
+
+Next we shall pre-process our data and impute any missing values. We shall try a number of algorithms on our data, all of which should (in theory) be able to cope with the vagaries of this particular dataset.
+
+Once we have trained our models, we can fit them to our training data and move on to the next step.
+
+## Feature engineering
+
+Here we add a feature which flags any `NA` values. These values will be imputed at the pre-processing stage, but our model should perform better knowing which of the values have been imputed adn which were present in the original data.
+
+The `across()` function from `{dplyr}` ... `discard()` from `{purrr}` ... makes this very easy to do:
+
+The `across()` function makes it very easy to create the new features:
+
+```{r}
+melbourne <- melbourne |> 
+   mutate(across( 
+      everything(), 
+      .fn = \(x) is.na(x), 
+      .names = "{.col}_{.fn}"
+   ))
+```
+
+We can now rename the new columns:
+
+```{r}
+melbourne <- melbourne |> 
+   rename_with(
+      .fn = \(x) str_replace(x, "_1", "_impute"),
+      .cols = ends_with("_1") 
+   )
+```
+
+The problem now is that we have created superfluous columns. We don't need columns when no values were imputed in the corresponding feature.
+
+We can remove the columns we don't need as follows:
+
+```{r}
+melbourne <- melbourne |> 
+   discard(\(x) all(x == FALSE))
+```
+
+We can now split our data and begin our feature pre-processing.
+
+## Splitting our dta and pre-processing
+
+Here we happen upon a problem. We need to ask ourselves what are we trying to achieve. Do we want to build a model that forecasts `price` based upon the **past** sale of houses with similar features? This would certainly be a very common scenario.
+
+However, we could instead model the price a house would have sold for, at a particular time, had it been offered for sale. This is also a very common problem a model might have to address.
+
+In what follows we shall address the second type of scenario. As such, we can split our data as normal, without having to take the time component into account.
+
+First we set a seed to help with reproducibility:
+
+```{r}
+set.seed(2024)
+```
+
+We now split our data:
+
+```{r}
+melb_split <- initial_split(melbourne, prop = 0.75)
+```
+
+Next we create our training and test sets:
+
+```{r}
+melb_train <- training(melb_split)
+melb_test <- testing(melb_split)
+```
+
+We shall also need cross validation folds on which to tune our model's hyper-parameters:
+
+```{r}
+melb_k_flds <- vfold_cv(melb_train)
+```
+
+With our data allocated into training and test sets, we can begin our data pre-processing. First we remove the `address` feature and convert all nominal variables to factors.
+
+```{r}
+recipe_gbm <- melb_train |> 
+   recipe(price ~ .) |> 
+   step_rm(address) |> 
+   step_mutate(postcode = as.character(postcode)) |> 
+   step_string2factor(all_nominal_predictors())
+```
+
+Our data is now ready to impute any missing values:
+
+```{r}
+recipe_gbm <- recipe_gbm |> 
+   step_impute_knn(all_predictors(), neighbors = tune())
+```
+
+Next we consider our nominal variables with very high dimensionality. Boosted trees don't handle high dimensional variables particularly well, so we shall use a suitable embedding:
+
+```{r}
+recipe_gbm <- recipe_gbm |> 
+   step_lencode_glm(c(suburb, seller_g, postcode, council_area), outcome = vars(price))
+```
+
+We can now build our model specification.
+
+## Tuning hyperparameters and fitting our model
+
+We are going to use `lightgmb` as our algorithm, as it should be a good match for this kind of problem. It is very powerful but needs extensive tuning to be seen at its best.
+
+```{r}
+spec_gbm <- 
+   boost_tree(
+      mtry = tune(), trees = tune(), min_n = tune(), 
+      tree_depth = tune(), learn_rate = tune(), 
+      loss_reduction = tune()
+   ) |> 
+   set_mode("regression") |> 
+   set_engine("lightgbm")
+```
+
+We combine our model specification and feature pre-processing steps into a `workflow()`:
+
+```{r}
+wrkflw_gbm <- 
+   workflow() |> 
+   add_model(spec_gbm) |> 
+   add_recipe(recipe_gbm)
+```
+
+We are almost ready to tune our model, but first we need to specify the range of the `mtry()` value from our model specification. This is because our recipe has a hyper that needs training; see [here](https://forum.posit.co/t/problems-trying-to-use-workflow-set-with-multiple-tunable-models-and-recipes/176540/2) for an informative discussion.
+
+For now, all we need to do is the following:
+
+```{r}
+params_gbm <- extract_parameter_set_dials(wrkflw_gbm) |> 
+   update(mtry = mtry(range = c(1, 12)))
+```
+
+This object is now passed to the `tune_grid()` function. But first we initialise a parallel back end to help speed things along:
+
+```{r}
+doParallel::registerDoParallel()
+```
+
+```{r}
+tune_grid_gbm <- tune_race_anova(
+   object = wrkflw_gbm,
+   resamples = melb_k_flds,
+   grid = 35,
+   metrics = metric_set(rsq, rmse),
+   param_info = params_gbm
+)
+```
+
+Now our model is tuned we can turn off the parallel back end:
+
+```{r}
+doParallel::stopImplicitCluster()
+```
+
+We save the best performing set of hyper-parameters:
+
+```{r}
+rsq_gbm <- select_best(tune_grid_gbm, metric = "rsq")
+```
+
+We can now finalise our workflow.
+
+```{r}
+wrkflw_gbm <- finalize_workflow(wrkflw_gbm, rsq_gbm)
+```
+
+All that remains at this stage is to fit our model on the training data:
+
+```{r}
+model_gbm <- fit(wrkflw_gbm, data = melb_train)
+```
+
+We can now `predict()` on our test set and evaluate our model for accuracy.
+
+## Predicting and evaluating
+
+Before we make any predictions, let's look at the variables that are most important to our model.
+
+```{r}
+vi(model_gbm) |> 
+   janitor::clean_names() |> 
+   mutate(variable = fct_reorder(variable, importance)) |> 
+   ggplot(aes(x = variable, y = importance)) +
+   geom_point(colour = "#a3c1ad", size = 3) +
+   geom_segment(
+      aes(x = variable, xend = variable, y = 0, yend = importance), 
+      linewidth = 2,
+      colour = "#a3c1ad"
+   ) +
+   labs(
+      x = element_blank(),
+      y = element_blank(),
+      title = "Variable importance scores for our lightgbm model"
+   ) +
+   coord_flip() +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 9
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 14,
+         vjust = 4
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white",
+         linewidth = 0.1
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.margin = margin(1, 1.5, 0.75, 1, "cm")
+   )
+```
+
+There are no real surprises here.
+
+Now let's `predict()` on our testing dataset and see how well our model performs.
+
+```{r}
+preds_gbm <- predict(model_gbm, new_data = melb_test)
+```
+
+We can bind the above to the actual values:
+
+```{r}
+preds_tbl_gbm <- melb_test |> 
+   bind_cols(preds_gbm) |> 
+   select(.pred, price) |> 
+   mutate(residuals = price - .pred)
+```
+
+The ideal is that our errors should be normally distributed.
+
+```{r}
+preds_tbl_gbm |> 
+   reframe(
+      names = c(
+         "mean of residuals",
+         "median of residuals",
+         "sum of residuals"
+      ),
+      values = c(
+         mean(residuals),
+         median(residuals),
+         sum(residuals)
+      )
+   )
+```
+
+The mean of the residuals looks good; but one glance at the median figure shows that this is misleading. We know straight away that the residuals are skewed to the right when the median is so much smaller than the mean.
+
+It's also highly desirable that any the variance is constant across our predictions. We can easily plot the residuals and see how our model fares in this respect:
+
+```{r}
+preds_tbl_gbm |> 
+   ggplot(aes(x = .pred, y = residuals)) + 
+   geom_point(colour = "#3b4d5b", alpha = 0.75) + 
+   geom_hline(yintercept = 0, colour = "#8e8e00", linewidth = 1.25) +
+   scale_x_continuous(label = label_currency()) +
+   scale_y_continuous(
+      limits = c(-3e6, 8e6),
+      breaks = seq(-2.5e6, 7.5e6, by = 2.5e6),
+      label = label_currency()
+   ) +
+   labs(
+      x = "Predicted values",
+      y = "Residual values",
+      title = "Residual plot for the melbourne housing dataset"
+   ) +
+   theme_minimal() +
+   theme(
+      axis.text = element_text(
+         colour = "white",
+         face = "bold",
+         size = 10
+      ),
+      axis.title.x = element_text(
+         colour = "white",
+         face = "bold",
+         size = 11,
+         vjust = -2
+      ),
+      axis.title.y = element_text(
+         colour = "white",
+         face = "bold",
+         size = 11,
+         vjust = 2.5
+      ),
+      plot.title = element_text(
+         colour = "white",
+         face = "bold",
+         size = 16,
+         vjust = 3.5
+      ),
+      plot.background = element_rect(
+         fill = "#1d262d",
+         colour = "#3b4d5b",
+         linewidth = 4.5
+      ),
+      panel.background = element_rect(
+         fill = "#1d262d",
+         colour = "white",
+         linewidth = 0.1
+      ),
+      panel.grid.major = element_line(
+         colour = "#3b4d5b",
+         linewidth = 0.1
+      ),
+      axis.ticks = element_line(
+         colour = "white",
+         linewidth = 1
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.margin = margin(1, 1.5, 0.75, 1, "cm")
+   )
+```
+
+We see some degree of heteroscedasticity, which perhaps is to be expected in a dataset of this sort. However, a much bigger problem is how far off some of our predictions are. Clearly we under-predict the price of very high value properties, leading to our residuals being skewed to the right.
+
+This suggests we shouldn't expect too much of our model. With our expectations set, let's look at how well our model does on the `rmse()` metric:
+
+```{r}
+rmse(preds_tbl_gbm, .pred, price)
+```
+
+No doubt the above figure is made much worse by very large errors in a relatively small number of cases. We can convert `.pred` and `price` to a log scale and check the `rmse()` again:
+
+```{r}
+preds_tbl_gbm |> 
+   mutate(across(.pred:price, \(x) log(x))) |> 
+   rmse(.pred, price)
+```
+
+This still isn't too good. For example, a good `rmse` score on the Ames housing dataset, also hosted on Kaggle, is around 0.13.
+
+What about the `rsq()` figure?
+
+```{r}
+rsq(preds_tbl_gbm, .pred, price)
+```
+
+So our model explains 78% of the variance. Obviously this isn't close to being good enough to put into production; but given the very poor quality of the data, I don't see an obvious way to make a significant improvement.
+
+One of the biggest challenges of building an accurate model is gathering a large amount of accurate data. Sadly this doesn't appear to have been achieved in this dataset.
