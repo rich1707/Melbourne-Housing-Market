@@ -18,11 +18,13 @@ number-depth: 3
 toc-location: "right"
 toc-title: "Section Headings"
 df-print: paged
-theme: superhero
+theme: 
+   - superhero
+   - custom.scss
 ---
 
 Here our task is to build a predictive model for a popular dataset on [Kaggle](https://www.kaggle.com/datasets/anthonypino/melbourne-housing-market). The dataset is not particularly complex, but various features of the data make it quite challenging to model.
-
+ 
 Two datasets are provided but we shall focus on the larger version of the data.
 
 # Preliminaries
